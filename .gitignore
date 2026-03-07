@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+*.log
+
+# Data and Outputs
+data/
+*.csv
+
+# Virtual environments
+venv/
+.env
+.venv
