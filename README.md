@@ -7,20 +7,19 @@ Automated data collection system for Gold & Silver trading decisions with 7-year
 ### First Time Setup (One-Time Only)
 Initialize the 7-year historical database:
 ```bash
-cd "/Users/dhruvmehta/Desktop/metal macro research"
-/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 metals_macro_system/scripts/initialize_historical_data.py
+python3 scripts/initialize_historical_data.py
 ```
 This will take 30-60 seconds and download ~15,000 records (7 years of daily data for 6 assets).
 
 ### Daily Usage
 After initialization, run this daily to fetch only new data:
 ```bash
-python3 metals_macro_system/scripts/run_all.py
+python3 scripts/run_all.py
 ```
 
 ### View the Daily Report
 ```bash
-tail -20 metals_macro_system/data/daily_report.txt
+tail -20 data/daily_report.txt
 ```
 
 ## System Overview
@@ -34,7 +33,7 @@ This system:
 
 ## Folder Structure
 ```
-metals_macro_system/
+metal-macro-research/
 ├── data/
 │   ├── prices.csv          # 7-year historical + daily updates (~15k records)
 │   ├── calendar.csv        # Economic events
@@ -85,7 +84,7 @@ metals_macro_system/
 **Run once** to build the 7-year historical database.
 
 ```bash
-python3 metals_macro_system/scripts/initialize_historical_data.py
+python3 scripts/initialize_historical_data.py
 ```
 
 - Fetches 7 years of **daily** data for all 6 assets
@@ -97,7 +96,7 @@ python3 metals_macro_system/scripts/initialize_historical_data.py
 Fetches only **new data** and appends to historical database.
 
 ```bash
-python3 metals_macro_system/scripts/fetch_prices.py
+python3 scripts/fetch_prices.py
 ```
 
 - Checks latest timestamp in database
@@ -109,7 +108,7 @@ python3 metals_macro_system/scripts/fetch_prices.py
 Master script that runs everything.
 
 ```bash
-python3 metals_macro_system/scripts/run_all.py
+python3 scripts/run_all.py
 ```
 
 Executes in order:
@@ -151,7 +150,7 @@ crontab -e
 
 Add:
 ```
-0 9 * * * cd "/Users/dhruvmehta/Desktop/metal macro research" && /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 metals_macro_system/scripts/run_all.py >> metals_macro_system/logs/cron.log 2>&1
+0 9 * * * python3 scripts/run_all.py >> logs/cron.log 2>&1
 ```
 
 ## Data Management
@@ -167,10 +166,10 @@ If you need to rebuild from scratch:
 
 ```bash
 # Backup existing data
-mv metals_macro_system/data/prices.csv metals_macro_system/data/prices_backup.csv
+mv data/prices.csv data/prices_backup.csv
 
 # Reinitialize
-python3 metals_macro_system/scripts/initialize_historical_data.py
+python3 scripts/initialize_historical_data.py
 ```
 
 ## Customization
@@ -209,7 +208,7 @@ RSS_FEEDS = [
 ### "No historical data found"
 Run the initialization script first:
 ```bash
-python3 metals_macro_system/scripts/initialize_historical_data.py
+python3 scripts/initialize_historical_data.py
 ```
 
 ### Rate Limiting
