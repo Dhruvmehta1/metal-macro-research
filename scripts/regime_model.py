@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 import os
@@ -12,12 +11,17 @@ def calculate_slope(series, window=20):
     """Calculates the slope of a rolling linear regression over 'window' days."""
     return series.pct_change(window, fill_method=None) * 100
 
-def detect_regime():
+def detect_regime(lag_days=30):
     """
     Classifies the daily macro environment into 4 Regimes based on
     Growth (GDP) and Inflation (Breakeven).
+
+    Parameters:
+    - lag_days: Number of days to lag macro data to simulate real-time availability.
+                GDP is typically released with a 30-day lag after quarter end.
+                This prevents using data that wasn't available at prediction time.
     """
-    
+
     # 1. Load Data
     if not os.path.exists(PRICES_FILE):
         print("Prices file not found.")
@@ -25,40 +29,47 @@ def detect_regime():
     if not os.path.exists(MACRO_FILE):
         print("Macro data file not found (Run fetch_fred_macro.py first).")
         return None
-        
+
     df = pd.read_csv(PRICES_FILE)
     df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    # Pivot to get Asset Prices (if needed, mainly for reference)
+
+    # Pivot to get Asset Prices
     df_pivot = df.pivot(index='timestamp', columns='asset', values='price')
-    
+
     # Load Macro Data
     macro = pd.read_csv(MACRO_FILE, index_col='date', parse_dates=True)
-    
-    # Merge
-    # Use LEFT JOIN to keep latest price date
-    merged = df_pivot.join(macro, how='left').sort_index()
-    
-    # Forward Fill missing Macro data
-    merged = merged.ffill()
-    
+
+    # IMPORTANT: Apply publication lag to macro data
+    # This shifts macro data forward in time to simulate when it was actually available
+    if len(macro) > 0:
+        macro_lagged = macro.copy()
+        macro_lagged.index = macro_lagged.index + pd.Timedelta(days=lag_days)
+    else:
+        macro_lagged = macro
+
+    # Merge with LEFT JOIN to keep all price dates
+    merged = df_pivot.join(macro_lagged, how='left').sort_index()
+
+    # DO NOT forward-fill GDP/breakeven - they should only be available on release dates
+    # We only ffill within the same release period (already handled by the lag)
+
     # 2. Calculate Trends
-    # Growth Proxy: GDP (Quarterly, filled daily)
-    # Using 60-day ROC (approx 1 quarter) to smooth the step-function of quarterly data
+    # Growth Proxy: GDP (Quarterly)
+    # Using 60-day ROC to smooth quarterly data
     merged['growth_momentum'] = merged['GDP'].pct_change(60, fill_method=None)
-    
+
     # Inflation Proxy: 10Y Breakeven
     # Using 20-day absolute change (1 month)
     merged['inflation_momentum'] = merged['Breakeven_10Y'].diff(20)
-    
+
     # 3. Define Regimes
     def get_regime(row):
         g = row['growth_momentum']
         i = row['inflation_momentum']
-        
-        # Tweak: >= 0 is better because GDP is slow. 
-        # If GDP is flat but high, we don't want to call it "Stagflation" immediately.
-        # Ideally we check levels, but for now >= 0 momentum on quarterly forward-fill is safer.
+
+        if pd.isna(g) or pd.isna(i):
+            return "Unclassified"
+
         if g >= 0 and i > 0:
             return "REFLATION (Boom)"
         elif g >= 0 and i <= 0:
@@ -71,13 +82,11 @@ def detect_regime():
             return "Unclassified"
 
     merged['regime'] = merged.apply(get_regime, axis=1)
-    
-    # Drop rows with NaN regimes
-    merged = merged.dropna(subset=['growth_momentum', 'inflation_momentum'])
-    
-    # Keep only relevant columns
+
+    # Keep all rows - regime will be "Unclassified" where data isn't available yet
+    # This is more honest than dropping rows
     result = merged[['GDP', 'Breakeven_10Y', 'growth_momentum', 'inflation_momentum', 'regime']]
-    
+
     return result
 
 if __name__ == "__main__":
@@ -86,6 +95,6 @@ if __name__ == "__main__":
         print("Regime Detection Complete.")
         print("\nLast 10 Days:")
         print(regimes[['regime', 'growth_momentum', 'inflation_momentum']].tail(10))
-        
+
         print("\nRegime Distribution (2016-Present):")
         print(regimes['regime'].value_counts(normalize=True))

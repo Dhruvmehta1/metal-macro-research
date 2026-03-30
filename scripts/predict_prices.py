@@ -32,14 +32,16 @@ NEWS_FILE = os.path.join(BASE_DIR, "data", "news.csv")
 
 def bin_real_yield(value):
     """Classify real yield into bins."""
+    if pd.isna(value):
+        return "unknown"
     if value < 0:
         return "negative"
     elif value < 1.5:
-        return "low_positive"  # Neutral/Supportive
+        return "low_positive"
     elif value < 2.5:
-        return "medium_positive"  # Restrictive (Current Norm)
+        return "medium_positive"
     else:
-        return "high_positive"  # > 2.5% (Crushing)
+        return "high_positive"
 
 
 def bin_dxy_change(value):
@@ -139,41 +141,150 @@ def bin_bb_pct_b(value):
         return "range_bound"
 
 
-def prepare_data():
-    """Load and prepare all data for analysis."""
-    print("Loading historical data...")
+def calculate_price_return(df, asset):
+    """
+    Calculate next-day return for an asset.
+    Returns a Series indexed by date with the return realized the NEXT day.
+    This is the TARGET variable - DO NOT use in feature engineering.
+    """
+    price_col = f"price_{asset}"
+    if price_col not in df.columns:
+        return pd.Series(index=df.index, dtype=float)
+    # Return = (P_t+1 - P_t) / P_t, stored at time t
+    returns = df[price_col].pct_change(fill_method=None).shift(-1) * 100
+    return returns
 
+
+def calculate_technical_indicators(df, asset, include_target=False):
+    """
+    Calculate technical indicators for a SINGLE asset using ONLY historical data up to each row.
+
+    Parameters:
+    - df: DataFrame with 'date' and f'price_{asset}' columns
+    - asset: 'Gold' or 'Silver'
+    - include_target: If True, also calculate next-day return (for backtest evaluation only)
+
+    Returns: DataFrame with technical indicator columns added
+    """
+    result = df.copy()
+    price_col = f"price_{asset}"
+
+    if price_col not in result.columns:
+        return result
+
+    prices = result[price_col]
+
+    # RSI (14)
+    delta = prices.diff()
+    gain = delta.where(delta > 0, 0).rolling(window=14, min_periods=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=14).mean()
+    rs = gain / loss
+    result[f"{asset}_rsi"] = 100 - (100 / (1 + rs))
+
+    # SMA (50, 200)
+    result[f"{asset}_sma50"] = prices.rolling(window=50, min_periods=50).mean()
+    result[f"{asset}_sma200"] = prices.rolling(window=200, min_periods=200).mean()
+
+    # Bollinger Bands (20, 2)
+    bb_mean = prices.rolling(window=20, min_periods=20).mean()
+    bb_std = prices.rolling(window=20, min_periods=20).std()
+    result[f"{asset}_bb_upper"] = bb_mean + (bb_std * 2)
+    result[f"{asset}_bb_lower"] = bb_mean - (bb_std * 2)
+    result[f"{asset}_pct_b"] = (prices - result[f"{asset}_bb_lower"]) / (result[f"{asset}_bb_upper"] - result[f"{asset}_bb_lower"])
+
+    # Volume RVOL (20-day)
+    vol_col = f"volume_{asset}"
+    if vol_col in result.columns:
+        vol_clean = result[vol_col].replace(0, np.nan)
+        result[f"{asset}_rvol"] = vol_clean / vol_clean.rolling(window=20, min_periods=20).mean()
+    else:
+        result[f"{asset}_rvol"] = 1.0
+
+    # TARGET (only if requested - for backtest evaluation)
+    if include_target:
+        result[f"{asset}_return"] = calculate_price_return(result, asset)
+        result[f"{asset}_direction"] = (result[f"{asset}_return"] > 0).astype(int)
+
+    return result
+
+
+def calculate_macro_features(df):
+    """
+    Calculate macro features that are shared across assets.
+    All calculations use ONLY data available up to each row.
+    """
+    result = df.copy()
+
+    # DXY change
+    if "price_DXY" in result.columns:
+        result["DXY_change"] = result["price_DXY"].pct_change(fill_method=None) * 100
+    else:
+        result["DXY_change"] = 0.0
+
+    return result
+
+
+def bin_features(df):
+    """Apply binning functions to create categorical features."""
+    result = df.copy()
+
+    result["real_yield_bin"] = result["real_yield"].apply(bin_real_yield)
+    result["dxy_bin"] = result["DXY_change"].apply(bin_dxy_change)
+
+    if "price_VIX" in result.columns:
+        result["vix_bin"] = result["price_VIX"].apply(bin_vix)
+        result["VIX_val"] = result["price_VIX"]
+    else:
+        result["vix_bin"] = "medium"
+        result["VIX_val"] = 20.0
+
+    result["china_gold_bin"] = result["monthly_change_tonnes"].apply(bin_china_gold_trend)
+    result["fed_bs_bin"] = result["Fed_yoy"].apply(bin_fed_balance_sheet)
+
+    for asset in ["Gold", "Silver"]:
+        result[f"{asset}_vol_bin"] = result[f"{asset}_rvol"].apply(bin_volume_trend)
+        result[f"{asset}_rsi_bin"] = result[f"{asset}_rsi"].apply(bin_rsi)
+        result[f"{asset}_trend_bin"] = result.apply(
+            lambda row: bin_trend_sma(row, asset), axis=1
+        )
+        result[f"{asset}_bb_bin"] = result[f"{asset}_pct_b"].apply(bin_bb_pct_b)
+
+    return result
+
+
+def load_base_data():
+    """
+    Load and merge raw data without any forward-looking calculations.
+    Returns a clean DataFrame ready for feature engineering.
+    """
     # Load prices
     df_prices = pd.read_csv(PRICES_FILE)
     df_prices["timestamp"] = pd.to_datetime(df_prices["timestamp"])
     df_prices["date"] = df_prices["timestamp"].dt.date
 
-    # Pivot to get one row per date
-    # We need both PRICE and VOLUME this time
+    # Pivot to one row per date
     df_pivot = df_prices.pivot_table(
         index="date", columns="asset", values=["price", "volume"], aggfunc="last"
     ).reset_index()
 
-    # Flatten columns (MultiIndex)
+    # Flatten MultiIndex columns
     new_cols = ["date"]
     if isinstance(df_pivot.columns, pd.MultiIndex):
-        # Format: price_Gold, volume_Gold
         for col in df_pivot.columns:
             if col[0] == "date" or col[1] == "":
                 continue
             new_cols.append(f"{col[0]}_{col[1]}")
     else:
-        new_cols = df_pivot.columns  # Already flattened? Unlikely given pivot_table
+        new_cols = df_pivot.columns
 
     df_pivot.columns = ["date"] + [c for c in new_cols if c != "date"]
 
-    # --- MERGE REGIME MODEL ---
+    # Merge regime data (with proper lag handling)
     try:
         from regime_model import detect_regime
-
         regimes = detect_regime()
         if regimes is not None:
-            # Regimes are indexed by timestamp. We need to match 'date'.
+            regimes = regimes.copy()
             regimes["date"] = regimes.index.date
             df_pivot = pd.merge(
                 df_pivot,
@@ -184,133 +295,131 @@ def prepare_data():
     except ImportError:
         print("Warning: Regime model import failed.")
         df_pivot["regime"] = "Unclassified"
+        df_pivot["growth_momentum"] = np.nan
+        df_pivot["inflation_momentum"] = np.nan
 
-    # -- Calculate Features for Each Asset --
-    for asset in ["Gold", "Silver"]:
-        # Returns
-        # TARGET DEFINITION: Next Day's Close vs Today's Close
-        # pct_change() calculates (Close_t - Close_t-1) / Close_t-1
-        # shift(-1) moves the return from (t+1) to (t)
-        # Result: Return realized at Close of t+1, relative to Close of t.
-        df_pivot[f"{asset}_return"] = (
-            df_pivot[f"price_{asset}"].pct_change(fill_method=None).shift(-1) * 100
-        )
-        df_pivot[f"{asset}_direction"] = (df_pivot[f"{asset}_return"] > 0).astype(int)
-
-        # Volume Trend (RVOL)
-        # 1. Fill 0 volume with NaN to avoid skewing average
-        vol_col = f"volume_{asset}"
-        if vol_col in df_pivot.columns:
-            df_pivot[vol_col] = df_pivot[vol_col].replace(0, np.nan)
-            # 2. Daily RVOL (Volume / 20-day SMA)
-            df_pivot[f"{asset}_rvol"] = (
-                df_pivot[vol_col] / df_pivot[vol_col].rolling(window=20).mean()
-            )
-        else:
-            df_pivot[f"{asset}_rvol"] = 1.0  # Default if missing
-
-    # Calculate DXY change
-    if "price_DXY" in df_pivot.columns:
-        df_pivot["DXY_change"] = (
-            df_pivot["price_DXY"].pct_change(fill_method=None) * 100
-        )
+    # Load and merge real yields
+    if os.path.exists(REAL_YIELD_FILE):
+        df_real = pd.read_csv(REAL_YIELD_FILE)
+        df_real["date"] = pd.to_datetime(df_real["date"]).dt.date
+        df_pivot = pd.merge(df_pivot, df_real[["date", "real_yield"]], on="date", how="left")
     else:
-        df_pivot["DXY_change"] = 0.0
+        df_pivot["real_yield"] = np.nan
 
-    # --- Technical Indicators (RSI, Trend, Bollinger) ---
-    for asset in ["Gold", "Silver"]:
-        price_col = f"price_{asset}"
-        if price_col not in df_pivot.columns:
-            continue
-
-        # 1. RSI (14) - Momentum
-        delta = df_pivot[price_col].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df_pivot[f"{asset}_rsi"] = 100 - (100 / (1 + rs))
-
-        # 2. Trend (SMA 50 vs 200) - Direction
-        df_pivot[f"{asset}_sma50"] = df_pivot[price_col].rolling(window=50).mean()
-        df_pivot[f"{asset}_sma200"] = df_pivot[price_col].rolling(window=200).mean()
-
-        # 3. Bollinger Bands (20, 2) - Volatility/Reversion
-        rolling_mean = df_pivot[price_col].rolling(window=20).mean()
-        rolling_std = df_pivot[price_col].rolling(window=20).std()
-        df_pivot[f"{asset}_bb_upper"] = rolling_mean + (rolling_std * 2)
-        df_pivot[f"{asset}_bb_lower"] = rolling_mean - (rolling_std * 2)
-        # %B (Position within bands)
-        df_pivot[f"{asset}_pct_b"] = (
-            df_pivot[price_col] - df_pivot[f"{asset}_bb_lower"]
-        ) / (df_pivot[f"{asset}_bb_upper"] - df_pivot[f"{asset}_bb_lower"])
-
-    # Load real yields
-    df_real = pd.read_csv(REAL_YIELD_FILE)
-    df_real["date"] = pd.to_datetime(df_real["date"]).dt.date
-
-    # Merge real yields (Use LEFT JOIN to keep price data even if yield is missing for today)
-    df = pd.merge(df_pivot, df_real[["date", "real_yield"]], on="date", how="left")
-
-    # Forward fill real yield for the very last day if missing (Macro data often lags 1 day)
-    df["real_yield"] = df["real_yield"].ffill()
-
-    # Load and merge China gold reserves
+    # Load China gold reserves
     if os.path.exists(CHINA_GOLD_FILE):
         df_china = pd.read_csv(CHINA_GOLD_FILE)
         df_china["date"] = pd.to_datetime(df_china["date"]).dt.date
-        df = pd.merge(
-            df, df_china[["date", "monthly_change_tonnes"]], on="date", how="left"
-        )
-        df["monthly_change_tonnes"] = df["monthly_change_tonnes"].fillna(0)
+        df_pivot = pd.merge(df_pivot, df_china[["date", "monthly_change_tonnes"]], on="date", how="left")
+        df_pivot["monthly_change_tonnes"] = df_pivot["monthly_change_tonnes"].fillna(0)
     else:
-        df["monthly_change_tonnes"] = 0
+        df_pivot["monthly_change_tonnes"] = 0
 
-    # Load and merge Fed balance sheet
+    # Load Fed balance sheet
     if os.path.exists(FED_BS_FILE):
         df_fed = pd.read_csv(FED_BS_FILE)
         df_fed["date"] = pd.to_datetime(df_fed["date"]).dt.date
-        df = pd.merge(df, df_fed[["date", "Fed_yoy"]], on="date", how="left")
-        df["Fed_yoy"] = df["Fed_yoy"].fillna(0)
+        df_pivot = pd.merge(df_pivot, df_fed[["date", "Fed_yoy"]], on="date", how="left")
+        df_pivot["Fed_yoy"] = df_pivot["Fed_yoy"].fillna(0)
     else:
-        df["Fed_yoy"] = 0
+        df_pivot["Fed_yoy"] = 0
 
-    # Create feature bins
-    df["real_yield_bin"] = df["real_yield"].apply(bin_real_yield)
-    df["dxy_bin"] = df["DXY_change"].apply(bin_dxy_change)
-    if "price_VIX" in df.columns:
-        df["vix_bin"] = df["price_VIX"].apply(bin_vix)
-        df["VIX_val"] = df["price_VIX"]  # Helper for display
-    else:
-        df["vix_bin"] = "medium"
-        df["VIX_val"] = 20.0
+    # Sort by date
+    df_pivot = df_pivot.sort_values("date").reset_index(drop=True)
 
-    df["china_gold_bin"] = df["monthly_change_tonnes"].apply(bin_china_gold_trend)
-    df["fed_bs_bin"] = df["Fed_yoy"].apply(bin_fed_balance_sheet)
+    return df_pivot
 
-    # Bin Volume and Technicals
+
+def prepare_data():
+    """
+    Load and prepare all data for analysis.
+
+    IMPORTANT: This function loads ALL data for convenience in daily prediction.
+    For backtesting, use prepare_historical_data() which properly handles lookahead bias.
+
+    Returns:
+    - df_train: Historical data with targets (for model training)
+    - latest: Most recent row with current conditions (for prediction)
+    """
+    print("Loading historical data...")
+
+    # Load base data
+    df = load_base_data()
+
+    # Calculate macro features
+    df = calculate_macro_features(df)
+
+    # Calculate technical indicators for each asset (WITH targets for training)
     for asset in ["Gold", "Silver"]:
-        df[f"{asset}_vol_bin"] = df[f"{asset}_rvol"].apply(bin_volume_trend)
-        df[f"{asset}_rsi_bin"] = df[f"{asset}_rsi"].apply(bin_rsi)
-        df[f"{asset}_trend_bin"] = df.apply(
-            lambda row: bin_trend_sma(row, asset), axis=1
-        )
-        df[f"{asset}_bb_bin"] = df[f"{asset}_pct_b"].apply(bin_bb_pct_b)
+        df = calculate_technical_indicators(df, asset, include_target=True)
 
-    # Remove NaN rows for TRAINING (Historical probabilities need outcomes)
-    # BUT, we need the LATEST row for PREDICTION (Current conditions) which has NaN return.
+    # Bin all features
+    df = bin_features(df)
 
-    # 1. Training Data (History)
+    # Fill missing macro data (forward fill - simulates real-time availability)
+    df["real_yield"] = df["real_yield"].ffill()
+    df["regime"] = df["regime"].fillna("Unclassified")
+
+    # Training data: rows with valid targets
     df_train = df.dropna(
         subset=["Gold_return", "Silver_return", "real_yield", "DXY_change"]
-    )
+    ).copy()
 
-    # 2. Latest Data (Inference)
-    # We take the very last row of the full feature-rich DF, assuming it's the latest date.
-    # We only care that the INPUT features (Macro, Tech) are present.
-    last_row = df.iloc[-1]
+    # Latest row for inference
+    latest = df.iloc[-1].copy() if len(df) > 0 else None
 
     print(f"Prepared {len(df_train)} days of historical training data")
-    return df_train, last_row
+    return df_train, latest
+
+
+def prepare_historical_data(df_base, end_idx):
+    """
+    Prepare historical data for walk-forward backtesting.
+
+    For each day in the backtest, we recalculate ALL indicators using ONLY
+    data available up to that day. This eliminates lookahead bias.
+
+    Parameters:
+    - df_base: Raw base data from load_base_data()
+    - end_idx: The index of the current day being predicted (exclusive for training, inclusive for current)
+
+    Returns:
+    - df_train: Training data (0 to end_idx-1) with targets and indicators
+    - current_row: The current day's features (at end_idx) for making prediction
+    """
+    # Training data: all rows BEFORE current day
+    df_train = df_base.iloc[:end_idx].copy()
+
+    # Current day: the row we're predicting
+    df_current = df_base.iloc[end_idx:end_idx+1].copy()
+
+    # Calculate macro features
+    df_train = calculate_macro_features(df_train)
+    df_current = calculate_macro_features(df_current)
+
+    # Calculate technical indicators WITH targets for training
+    for asset in ["Gold", "Silver"]:
+        df_train = calculate_technical_indicators(df_train, asset, include_target=True)
+        df_current = calculate_technical_indicators(df_current, asset, include_target=False)
+
+    # Bin features
+    df_train = bin_features(df_train)
+    df_current = bin_features(df_current)
+
+    # Forward fill macro data
+    df_train["real_yield"] = df_train["real_yield"].ffill()
+    df_current["real_yield"] = df_current["real_yield"].ffill()
+
+    df_train["regime"] = df_train["regime"].fillna("Unclassified")
+    df_current["regime"] = df_current["regime"].fillna("Unclassified")
+
+    # Drop rows with NaN targets from training
+    df_train = df_train.dropna(subset=["Gold_return", "Silver_return"])
+
+    # Get current conditions as dict
+    current_row = df_current.iloc[-1] if len(df_current) > 0 else None
+
+    return df_train, current_row
 
 
 def calculate_rules_and_risk(df, asset, current_conditions):
@@ -537,6 +646,93 @@ def calculate_bayesian_probability_legacy(df, asset, current_conditions):
         len(df_conditions),
         used_full_model,
     )
+
+
+def calculate_sentiment_for_date(news_df, current_date_str, assets=("Gold", "Silver")):
+    """
+    Calculate sentiment scores for a specific date, using only news available up to that date.
+
+    Parameters:
+    - news_df: DataFrame with 'timestamp', 'asset', 'sentiment', 'headline' columns
+    - current_date_str: The date for which we're calculating sentiment (YYYY-MM-DD or date object)
+    - assets: Tuple of assets to calculate sentiment for
+
+    Returns:
+    - sentiment_data: Dict with sentiment scores and labels for each asset
+    """
+    sentiment_data = {
+        asset: {"score": 0.0, "label": "Neutral", "items": []}
+        for asset in assets
+    }
+
+    if news_df is None or news_df.empty:
+        return sentiment_data
+
+    # Parse current date
+    if isinstance(current_date_str, str):
+        current_date = pd.to_datetime(current_date_str)
+    else:
+        current_date = pd.to_datetime(current_date_str)
+
+    # Filter news: only items published BEFORE or ON the current date
+    # and within the last 48 hours relative to current date
+    news_df = news_df.copy()
+    news_df["timestamp"] = pd.to_datetime(news_df["timestamp"], errors="coerce")
+    news_df = news_df.dropna(subset=["timestamp"])
+
+    # Time window: (current_date - 48 hours) to current_date
+    window_start = current_date - pd.Timedelta(hours=48)
+
+    df_recent = news_df[
+        (news_df["timestamp"] > window_start) &
+        (news_df["timestamp"] <= current_date)
+    ]
+
+    if df_recent.empty:
+        return sentiment_data
+
+    # Process Gold sentiment
+    gold_news = df_recent[df_recent["asset"] == "Gold"]
+    economy_news = df_recent[df_recent["asset"] == "Economy"]
+
+    score_g_raw = gold_news["sentiment"].mean() if not gold_news.empty else 0
+    score_eco = economy_news["sentiment"].mean() if not economy_news.empty else 0
+
+    final_gold_score = score_g_raw - (0.5 * score_eco)
+
+    if final_gold_score > 0.2:
+        label_g = "Bullish"
+    elif final_gold_score < -0.2:
+        label_g = "Bearish"
+    else:
+        label_g = "Neutral"
+
+    sentiment_data["Gold"] = {
+        "score": final_gold_score,
+        "label": label_g,
+        "items": gold_news.head(3)["headline"].tolist() + economy_news.head(2)["headline"].tolist()
+    }
+
+    # Process Silver sentiment
+    silver_news = df_recent[df_recent["asset"] == "Silver"]
+    score_s_raw = silver_news["sentiment"].mean() if not silver_news.empty else 0
+
+    final_silver_score = score_s_raw + (0.5 * final_gold_score)
+
+    if final_silver_score > 0.2:
+        label_s = "Bullish"
+    elif final_silver_score < -0.2:
+        label_s = "Bearish"
+    else:
+        label_s = "Neutral"
+
+    sentiment_data["Silver"] = {
+        "score": final_silver_score,
+        "label": label_s,
+        "items": silver_news.head(3)["headline"].tolist()
+    }
+
+    return sentiment_data
 
 
 def calculate_expected_range(df, asset, current_conditions, confidence=0.95):
